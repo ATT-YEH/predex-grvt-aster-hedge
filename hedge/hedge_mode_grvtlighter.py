@@ -1,47 +1,31 @@
 import asyncio
-import json
 import signal
 import logging
 import os
 import sys
 import time
-import requests
-import traceback
 import csv
-from decimal import Decimal
-from typing import Tuple
 from decimal import Decimal
 from typing import Optional, Dict, Any, Tuple
 
-# --- 導入新的客戶端 ---
 from exchanges.grvt import GrvtClient
 from exchanges.lighter import LighterClient
-
-import websockets
 from datetime import datetime
 import pytz
 
-# 確保可以找到 exchanges 模組 (必須在文件開頭)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --- 策略常數 ---
-HEDGE_TIMEOUT = 10  # Taker 腿對沖超時時間 (秒)
-HOLDING_TIME = 180  # 預期持倉時間 (5 分鐘)
-MAX_RISK_USD = Decimal('30')  # 最大可容忍淨浮動虧損 (USD)
-
-# ------------------------------------------------------------
-# Config import (align with repo style)
-# ------------------------------------------------------------
-try:
-    from helpers.config import Config  # type: ignore
-except Exception:
-    class Config:  # fallback
-        def __init__(self, d: Dict[str, Any]):
-            for k, v in d.items():
-                setattr(self, k, v)
-
 HEDGE_TIMEOUT = 10
-SLEEP_BETWEEN_CYCLES = 0.2
+HOLDING_TIME = 180
+MAX_RISK_USD = Decimal('30')
+
+
+class Config:
+    """Simple config class to wrap dictionary for exchange clients."""
+
+    def __init__(self, config_dict: Dict[str, Any]):
+        for key, value in config_dict.items():
+            setattr(self, key, value)
 
 
 def _normalize_order_result(res: Any) -> Tuple[bool, Optional[str], Optional[str]]:
@@ -52,256 +36,226 @@ def _normalize_order_result(res: Any) -> Tuple[bool, Optional[str], Optional[str
     Supports:
       - OrderResult: has .success, .order_id, .error_message
       - OrderInfo: has .order_id, .status
-      - dict: keys may be success/order_id/error_message/id
+      - dict: keys may be success/order_id/error_message/id/client_order_index
     """
     if res is None:
         return False, None, "order result is None"
 
-    # dict style
     if isinstance(res, dict):
-        ok = bool(res.get("success", True))  # many dict results don't have success; treat as ok unless explicit False
-        oid = res.get("order_id") or res.get("id") or res.get("client_order_id")
+        ok = bool(res.get("success", True))
+        oid = res.get("order_id") or res.get("id") or res.get("client_order_index")
         err = res.get("error_message") or res.get("error") or res.get("message")
         if ok is False and not err:
             err = "order failed (dict)"
         return ok, str(oid) if oid is not None else None, err
 
-    # OrderResult style
     if hasattr(res, "success"):
         ok = bool(getattr(res, "success"))
         oid = getattr(res, "order_id", None)
         err = getattr(res, "error_message", None)
         return ok, str(oid) if oid is not None else None, err
 
-    # OrderInfo style
     if hasattr(res, "order_id"):
         oid = getattr(res, "order_id", None)
-        # If it returned an OrderInfo object, assume placement succeeded (status might be OPEN/PENDING)
         return True, str(oid) if oid is not None else None, None
 
-    # unknown object
     return False, None, f"unknown order result type: {type(res)}"
 
 
 class HedgeBot:
-    """
-    GRVT (maker post-only limit) -> Lighter (hedge market/IOC)
-    Trigger hedge ONLY on GRVT WS fill event.
-    """
+    """Trading bot that places post-only orders on GRVT and hedges with market orders on Lighter."""
 
     def __init__(
         self,
         ticker: str,
         order_quantity: Decimal,
-        fill_timeout: int = 10,
-        iterations: int = 5,
-        start_side: str = "buy",
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        start_side: str = 'buy',
+        holding_time: int = HOLDING_TIME,
+        hedge_timeout: int = HEDGE_TIMEOUT,
+        max_risk_usd: Decimal = MAX_RISK_USD,
+        sleep_between_cycles: float = 10.0,
+        open_wait_timeout: Optional[int] = None,
+        grvt_force_market: bool = False,
     ):
         self.ticker = ticker
-        self.order_quantity = Decimal(order_quantity)
-        self.fill_timeout = int(fill_timeout)
-        self.iterations = int(iterations)
-        self.start_side = start_side.lower()
+        self.order_quantity = order_quantity
+        self.fill_timeout = fill_timeout
+        self.iterations = iterations
+        self.start_side = start_side
+        self.current_side = start_side
+        self.holding_time = holding_time
+        self.hedge_timeout = hedge_timeout
+        self.max_risk_usd = Decimal(str(max_risk_usd))
+        self.sleep_between_cycles = sleep_between_cycles
+        self.open_wait_timeout = open_wait_timeout if open_wait_timeout is not None else fill_timeout
+        self.grvt_force_market = grvt_force_market
 
-        self.logger = logging.getLogger("HedgeBot-GRVT-Lighter")
-        self.logger.setLevel(logging.INFO)
-        if not self.logger.handlers:
-            ch = logging.StreamHandler()
-            fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-            ch.setFormatter(fmt)
-            self.logger.addHandler(ch)
+        self.grvt_position = Decimal('0')
+        self.lighter_position = Decimal('0')
+        self.grvt_open_price = Decimal('0')
+        self.lighter_open_price = Decimal('0')
+        self.open_time = 0.0
+        self.current_net_pnl = Decimal('0')
 
-        self.grvt_client: Optional[GrvtClient] = None
-        self.lighter_client: Optional[LighterClient] = None
+        self.is_closing = False
 
-        self.grvt_contract_id: Optional[str] = None
-        self.grvt_tick_size: Optional[Decimal] = None
-        self.lighter_contract_id: Optional[str] = None
-        self.lighter_tick_size: Optional[Decimal] = None
+        os.makedirs("logs", exist_ok=True)
+        self.log_filename = f"logs/grvt_lighter_{ticker}_hedge_mode_log.txt"
+        self.csv_filename = f"logs/grvt_lighter_{ticker}_hedge_mode_trades.csv"
 
-        # maker state
-        self.waiting_for_grvt_fill = False
-        self.current_grvt_order_id: Optional[str] = None
-        self.last_grvt_fill_side: str = ""
-        self.last_grvt_fill_size: Decimal = Decimal("0")
-        self.last_grvt_fill_price: Decimal = Decimal("0")
+        self._initialize_csv_file()
+        self._setup_logger()
 
-        # hedge state
+        self.stop_flag = False
+        self.order_counter = 0
+
+        self.grvt_client = None
+        self.grvt_contract_id = None
+        self.grvt_tick_size = None
+        self.grvt_order_status = None
+        self.grvt_best_bid = None
+        self.grvt_best_ask = None
+        self.current_grvt_order_id = None
+
+        self.lighter_client = None
+        self.lighter_contract_id = None
+        self.lighter_tick_size = None
+        self.lighter_best_bid = None
+        self.lighter_best_ask = None
+
         self.waiting_for_lighter_fill = False
-        self.current_lighter_client_order_id: Optional[str] = None
-        self.last_lighter_fill_side: str = ""
-        self.last_lighter_fill_size: Decimal = Decimal("0")
-        self.last_lighter_fill_price: Decimal = Decimal("0")
-
-        self._shutdown = False
-
-    async def initialize_clients(self):
-        if self.grvt_client is None:
-            grvt_cfg = Config({
-                "ticker": self.ticker,
-                "contract_id": "",
-                "quantity": self.order_quantity,
-                "tick_size": Decimal("0.01"),
-                "close_order_side": "sell",
-            })
-            self.grvt_client = GrvtClient(grvt_cfg)
-
-        if self.lighter_client is None:
-            lighter_cfg = Config({
-                "ticker": self.ticker,
-                "contract_id": "",
-                "quantity": self.order_quantity,
-                "tick_size": Decimal("0.01"),
-                "close_order_side": "sell",
-            })
-            self.lighter_client = LighterClient(lighter_cfg)
-
-        # WS fill handlers
-        self.grvt_client.setup_order_update_handler(self._on_grvt_order_updates)
-        self.lighter_client.setup_order_update_handler(self._on_lighter_order_updates)
-
-        self.logger.info("Connecting GRVT...")
-        await self.grvt_client.connect()
-
-        self.logger.info("Connecting Lighter...")
-        await self.lighter_client.connect()
-
-        await self._init_contracts()
-
-    async def _init_contracts(self):
-        self.grvt_contract_id, self.grvt_tick_size = await self.grvt_client.get_contract_attributes()
-        self.lighter_contract_id, self.lighter_tick_size = await self.lighter_client.get_contract_attributes()
-
-        self.logger.info(f"GRVT contract_id={self.grvt_contract_id} tick={self.grvt_tick_size}")
-        self.logger.info(f"Lighter contract_id={self.lighter_contract_id} tick={self.lighter_tick_size}")
-
-    # ---------------- WS Handlers ----------------
-    def _on_grvt_order_updates(self, orders: list):
-        if not orders:
-            return
-        for od in orders:
-            try:
-                status = str(od.get("status", "")).upper()
-                side = str(od.get("side", "")).lower()
-                order_id = str(od.get("order_id", od.get("id", "")))
-                filled = Decimal(str(od.get("filled_size", od.get("filled", 0)) or 0))
-                price = Decimal(str(od.get("price", 0) or 0))
-
-                if not self.waiting_for_grvt_fill:
-                    continue
-                if self.current_grvt_order_id and order_id != str(self.current_grvt_order_id):
-                    continue
-
-                if status == "FILLED" and filled > 0:
-                    self.last_grvt_fill_side = side
-                    self.last_grvt_fill_size = filled
-                    self.last_grvt_fill_price = price
-                    self.waiting_for_grvt_fill = False
-                    self.logger.info(f"✅ GRVT FILLED: {side} {filled} @ {price} (order_id={order_id})")
-            except Exception as e:
-                self.logger.error(f"GRVT WS handler error: {e}")
-
-    def _on_lighter_order_updates(self, orders: list):
-        if not orders:
-            return
-        for od in orders:
-            try:
-                status = str(od.get("status", "")).upper()
-                is_ask = bool(od.get("is_ask", False))
-                side = "sell" if is_ask else "buy"
-
-                client_order_index = od.get("client_order_index", None)
-                filled_base_amount = Decimal(str(od.get("filled_base_amount", 0) or 0))
-                price = Decimal(str(od.get("price", 0) or 0))
-
-                if not self.waiting_for_lighter_fill:
-                    continue
-                if self.current_lighter_client_order_id is not None:
-                    if str(client_order_index) != str(self.current_lighter_client_order_id):
-                        continue
-
-                if status == "OPEN" and filled_base_amount > 0:
-                    status = "PARTIALLY_FILLED"
-
-                if status == "FILLED" and filled_base_amount > 0:
-                    self.last_lighter_fill_side = side
-                    self.last_lighter_fill_size = filled_base_amount
-                    self.last_lighter_fill_price = price
-                    self.waiting_for_lighter_fill = False
-                    self.logger.info(
-                        f"✅ Lighter FILLED: {side} {filled_base_amount} @ {price} (client_order_index={client_order_index})"
-                    )
-            except Exception as e:
-                self.logger.error(f"Lighter WS handler error: {e}")
-
-    # ---------------- Orders ----------------
-    async def place_grvt_maker_order(self, side: str, quantity: Decimal) -> bool:
-        assert self.grvt_client is not None
-
-        side = side.lower()
-        price = await self.grvt_client.get_order_price(side)
-        price = self.grvt_client.round_to_tick(price) if hasattr(self.grvt_client, "round_to_tick") else price
-
-        # reset fill cache
-        self.last_grvt_fill_side = ""
-        self.last_grvt_fill_size = Decimal("0")
-        self.last_grvt_fill_price = Decimal("0")
-
-        self.logger.info(f"🧩 Placing GRVT maker (post-only): {side} {quantity} @ {price}")
-
-        res = await self.grvt_client.place_post_only_order(self.grvt_contract_id, quantity, price, side)
-
-        ok, oid, err = _normalize_order_result(res)
-        if not ok:
-            self.logger.warning(f"❌ GRVT maker order failed: {err}")
-            return False
-
-        if oid is None:
-            # even if order placement succeeded, we need an id to track fill
-            self.logger.warning("❌ GRVT maker order returned no order_id; cannot track fills.")
-            return False
-
-        self.current_grvt_order_id = str(oid)
-        self.waiting_for_grvt_fill = True
-        self.logger.info(f"🧾 GRVT maker order placed. order_id={self.current_grvt_order_id}")
-        return True
-
-    async def wait_grvt_fill_or_timeout(self) -> bool:
-        assert self.grvt_client is not None
-
-        start = time.time()
-        while self.waiting_for_grvt_fill and (time.time() - start) < self.fill_timeout and not self._shutdown:
-            await asyncio.sleep(0.05)
-
-        if not self.waiting_for_grvt_fill:
-            return True
-
-        self.logger.warning(f"⏰ GRVT maker fill timeout ({self.fill_timeout}s). Canceling...")
-        if self.current_grvt_order_id:
-            try:
-                await self.grvt_client.cancel_order(self.current_grvt_order_id)
-            except Exception as e:
-                self.logger.error(f"GRVT cancel error: {e}")
-
-        self.waiting_for_grvt_fill = False
-        return False
-
-    async def place_lighter_market_order(self, side: str, quantity: Decimal) -> bool:
-        assert self.lighter_client is not None
-
-        side = side.lower()
-
-        self.last_lighter_fill_side = ""
-        self.last_lighter_fill_size = Decimal("0")
-        self.last_lighter_fill_price = Decimal("0")
+        self.order_execution_complete = False
+        self.current_lighter_side = None
+        self.current_lighter_quantity = None
         self.current_lighter_client_order_id = None
 
-        self.logger.info(f"⚖️ Hedging on Lighter (MARKET/IOC): {side} {quantity}")
+        self.pnl_monitor_task = None
 
-        res = await self.lighter_client.place_market_order(self.lighter_contract_id, quantity, side)
-        ok, oid, err = _normalize_order_result(res)
+    def _setup_logger(self):
+        self.logger = logging.getLogger(f"hedge_bot_{self.ticker}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.handlers.clear()
+
+        logging.getLogger('urllib3').setLevel(logging.WARNING)
+        logging.getLogger('requests').setLevel(logging.WARNING)
+        logging.getLogger('websockets').setLevel(logging.WARNING)
+
+        file_handler = logging.FileHandler(self.log_filename)
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        self.logger.addHandler(file_handler)
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+        self.logger.propagate = False
+
+    def shutdown(self, signum=None, frame=None):
+        self.stop_flag = True
+        self.logger.info("\n🛑 Stopping...")
+
+        if self.pnl_monitor_task and not self.pnl_monitor_task.done():
+            self.pnl_monitor_task.cancel()
+            self.logger.info("🔌 PNL monitor task cancelled")
+
+        if self.grvt_client:
+            self.logger.info("🔌 GRVT WebSocket will be disconnected")
+        if self.lighter_client:
+            self.logger.info("🔌 Lighter WebSocket will be disconnected")
+
+        for handler in self.logger.handlers[:]:
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+    def _initialize_csv_file(self):
+        if not os.path.exists(self.csv_filename):
+            with open(self.csv_filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+
+    def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str):
+        timestamp = datetime.now(pytz.UTC).isoformat()
+        with open(self.csv_filename, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([exchange, timestamp, side, price, quantity])
+        self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+
+    def handle_lighter_hedge_result(self, order_data):
+        try:
+            side = order_data.get('side', '').upper()
+            filled_size = Decimal(order_data.get('filled_size', '0'))
+            avg_price = Decimal(order_data.get('price', '0'))
+
+            if filled_size == 0:
+                return
+
+            if side == "SELL":
+                self.lighter_position -= filled_size
+            else:
+                self.lighter_position += filled_size
+
+            self.lighter_open_price = avg_price
+
+            self.logger.info(f"📊 Lighter hedge FILLED: {side} {filled_size} @ {avg_price}")
+            self.log_trade_to_csv(exchange='Lighter', side=side, price=str(avg_price), quantity=str(filled_size))
+            self.order_execution_complete = True
+
+            if self.is_closing:
+                self.lighter_position = Decimal('0')
+                self.logger.info("✅ Lighter Taker 倉位已強制清零 (平倉完成)")
+
+        except Exception as e:
+            self.logger.error(f"Error handling Lighter hedge result: {e}")
+
+    async def close_grvt_market_position(self, direction: str, quantity: Decimal):
+        if not self.grvt_client:
+            return
+
+        self.logger.critical(
+            f"🚨 Executing EMERGENCY MARKET CLOSE on GRVT (Fallback to aggressive Limit): {direction} {quantity}")
+
+        try:
+            order_result = await self.grvt_client.place_open_order(
+                contract_id=self.grvt_contract_id,
+                quantity=quantity,
+                direction=direction.lower()
+            )
+
+            ok, _, err = _normalize_order_result(order_result)
+            if ok:
+                self.grvt_position = Decimal('0')
+                self.logger.critical("✅ GRVT單邊倉位已成功發送平倉，內部狀態已清零。")
+            else:
+                self.logger.critical(f"❌ 嚴重錯誤：GRVT平倉失敗: {err}")
+                self.stop_flag = True
+
+        except Exception as e:
+            self.logger.critical(f"❌ 嚴重錯誤：GRVT平倉異常: {e}")
+            self.stop_flag = True
+
+    async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal):
+        if not self.lighter_client:
+            return False
+
+        self.logger.info(f"🚀 Placing Lighter MARKET order: {lighter_side} {quantity}")
+        self.current_lighter_client_order_id = None
+
+        order_result = await self.lighter_client.place_market_order(
+            contract_id=self.lighter_contract_id,
+            quantity=quantity,
+            side=lighter_side.lower()
+        )
+
+        ok, oid, err = _normalize_order_result(order_result)
         if not ok:
-            self.logger.error(f"❌ Lighter hedge order failed: {err}")
+            self.logger.error(f"❌ Lighter Taker order failed: {err}")
             return False
 
         if oid is None:
@@ -311,91 +265,385 @@ class HedgeBot:
         self.current_lighter_client_order_id = str(oid)
         self.waiting_for_lighter_fill = True
         self.logger.info(f"🧾 Lighter hedge sent. client_order_index={self.current_lighter_client_order_id}")
-        return True
 
-    async def wait_lighter_fill_or_timeout(self) -> bool:
-        start = time.time()
-        while self.waiting_for_lighter_fill and (time.time() - start) < HEDGE_TIMEOUT and not self._shutdown:
-            await asyncio.sleep(0.05)
-
-        if not self.waiting_for_lighter_fill:
+        hedge_filled = await self.wait_lighter_fill_or_timeout()
+        if hedge_filled:
             return True
 
-        self.logger.error(f"⏰ Lighter hedge timeout ({HEDGE_TIMEOUT}s).")
+        self.logger.error(f"❌ Lighter Taker 對沖失敗或超時 ({self.hedge_timeout}s)")
+        grvt_side_to_close = 'sell' if self.grvt_position > 0 else 'buy'
+        await self.close_grvt_market_position(grvt_side_to_close, abs(self.grvt_position))
+        return False
+
+    async def wait_lighter_fill_or_timeout(self) -> bool:
+        start_time = time.time()
+
+        while time.time() - start_time < self.hedge_timeout:
+            if not self.waiting_for_lighter_fill:
+                return True
+            if self.stop_flag:
+                break
+            await asyncio.sleep(0.1)
+
         self.waiting_for_lighter_fill = False
         return False
 
-    # ---------------- Loop ----------------
+    async def calculate_and_monitor_pnl(self):
+        while not self.stop_flag:
+            await asyncio.sleep(0.5)
+
+            if self.grvt_position == 0 or self.lighter_position == 0 or self.open_time == 0:
+                self.current_net_pnl = Decimal('0')
+                continue
+
+            try:
+                grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+                lighter_bid, lighter_ask = await self.lighter_client.fetch_bbo_prices(self.lighter_contract_id)
+
+                if grvt_bid == 0 or lighter_bid == 0 or grvt_bid >= grvt_ask or lighter_bid >= lighter_ask:
+                    continue
+
+                if self.grvt_position > 0:
+                    grvt_pnl = self.grvt_position * (grvt_bid - self.grvt_open_price)
+                else:
+                    grvt_pnl = self.grvt_position * (self.grvt_open_price - grvt_ask)
+
+                if self.lighter_position > 0:
+                    lighter_pnl = self.lighter_position * (lighter_bid - self.lighter_open_price)
+                else:
+                    lighter_pnl = self.lighter_position * (self.lighter_open_price - lighter_ask)
+
+                net_pnl = grvt_pnl + lighter_pnl
+                self.current_net_pnl = net_pnl
+
+                if net_pnl < -self.max_risk_usd:
+                    self.logger.critical(f"🔥🔥🔥 風險值突破！淨浮動虧損達到 {net_pnl:.2f} USD 🔥🔥🔥")
+                    self.open_time = 0
+                    return
+
+            except Exception as e:
+                self.logger.error(f"❌ PNL 計算錯誤: {e}")
+
+    def initialize_grvt_client(self):
+        if self.grvt_client is None:
+            config_dict = {'ticker': self.ticker, 'contract_id': '', 'quantity': self.order_quantity,
+                           'tick_size': Decimal('0.01'), 'close_order_side': 'sell'}
+            config = Config(config_dict)
+            self.grvt_client = GrvtClient(config)
+            self.logger.info("✅ GRVT Maker client initialized successfully")
+        return self.grvt_client
+
+    def initialize_lighter_client(self):
+        if self.lighter_client is None:
+            config_dict = {'ticker': self.ticker, 'contract_id': '', 'quantity': self.order_quantity,
+                           'tick_size': Decimal('0.01'), 'close_order_side': 'sell'}
+            config = Config(config_dict)
+            self.lighter_client = LighterClient(config)
+            self.logger.info("✅ Lighter Taker client initialized successfully")
+        return self.lighter_client
+
+    async def get_contract_info(self):
+        self.grvt_contract_id, self.grvt_tick_size = await self.grvt_client.get_contract_attributes()
+        self.lighter_contract_id, self.lighter_tick_size = await self.lighter_client.get_contract_attributes()
+
+        if self.order_quantity < self.grvt_client.config.quantity or self.order_quantity < self.lighter_client.config.quantity:
+            raise ValueError("Order quantity is less than minimum quantity on one of the exchanges.")
+
+    async def fetch_current_exchange_positions(self):
+        try:
+            grvt_real_pos = await self.grvt_client.get_account_positions()
+            lighter_real_pos = await self.lighter_client.get_account_positions()
+
+            if abs(grvt_real_pos) < self.grvt_client.config.quantity * Decimal('0.5'):
+                self.grvt_position = Decimal('0')
+            if abs(lighter_real_pos) < self.lighter_client.config.quantity * Decimal('0.5'):
+                self.lighter_position = Decimal('0')
+
+            self.logger.info(f"🔄 外部倉位檢查完成。GRVT: {self.grvt_position}, Lighter: {self.lighter_position}")
+
+        except Exception as e:
+            self.logger.error(f"❌ 無法獲取外部倉位: {e}")
+
+    async def place_grvt_open_order(self, side: str, quantity: Decimal):
+        if self.grvt_force_market:
+            self.logger.warning(f"⚠️ GRVT FORCE MARKET enabled: {side} {quantity}")
+            try:
+                await self.grvt_client.place_market_order(
+                    contract_id=self.grvt_contract_id,
+                    quantity=quantity,
+                    side=side.lower()
+                )
+            except Exception as e:
+                raise Exception(f"Failed to place GRVT market order: {e}")
+
+            self.grvt_order_status = "OPEN"
+            self.current_grvt_order_id = None
+            return None, None
+
+        order_result = await self.grvt_client.place_open_order(
+            contract_id=self.grvt_contract_id,
+            quantity=quantity,
+            direction=side.lower()
+        )
+
+        ok, oid, err = _normalize_order_result(order_result)
+        if ok:
+            self.current_grvt_order_id = oid
+            return oid, getattr(order_result, 'price', None)
+        raise Exception(f"Failed to place order: {err}")
+
+    async def close_both_positions(self):
+        self.logger.info("🕒 執行雙邊平倉...")
+
+        grvt_qty = abs(self.grvt_position)
+        lighter_qty = abs(self.lighter_position)
+
+        if grvt_qty == 0 and lighter_qty == 0:
+            self.logger.warning("倉位已經為零，跳過平倉。")
+            return
+
+        self.is_closing = True
+
+        grvt_close_side = 'sell' if self.grvt_position > 0 else 'buy'
+        lighter_close_side = 'sell' if self.lighter_position > 0 else 'buy'
+
+        self.logger.info(f"Closing GRVT Market: {grvt_close_side} {grvt_qty}")
+        await self.close_grvt_market_position(grvt_close_side, grvt_qty)
+
+        self.logger.info(f"Closing Lighter Taker: {lighter_close_side} {lighter_qty}")
+        await self.place_lighter_market_order(lighter_close_side, lighter_qty)
+
+        self.logger.info("✅ 雙邊平倉指令已發送完成，等待 WS 確認清零。")
+        self.order_execution_complete = True
+
+        await asyncio.sleep(5)
+        self.is_closing = False
+
+    def handle_grvt_order_update(self, order_data):
+        if self.stop_flag:
+            self.logger.warning("Bot is shutting down, ignoring incoming FILLED order to prevent hedge.")
+            return
+
+        updates = order_data if isinstance(order_data, list) else [order_data]
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+
+            side = update.get('side', '').lower()
+            filled_size = Decimal(update.get('filled_size', '0'))
+            price = Decimal(update.get('price', '0'))
+            status = update.get('status')
+
+            if status != 'FILLED':
+                self.grvt_order_status = status
+                continue
+
+            if self.is_closing:
+                self.logger.info(f"✅ GRVT 平倉成交: {side} {filled_size} @ {price} [Cleaned]")
+                self.log_trade_to_csv(exchange='GRVT', side=f"CLOSE_{side}", price=str(price),
+                                      quantity=str(filled_size))
+
+                self.grvt_position = Decimal('0')
+                self.is_closing = False
+                return
+
+            if side == 'buy':
+                self.grvt_position += filled_size
+                lighter_side = 'sell'
+            else:
+                self.grvt_position -= filled_size
+                lighter_side = 'buy'
+
+            self.grvt_open_price = price
+            self.grvt_order_status = 'FILLED'
+
+            self.log_trade_to_csv(exchange='GRVT', side=side, price=str(price), quantity=str(filled_size))
+
+            self.current_lighter_side = lighter_side
+            self.current_lighter_quantity = filled_size
+            self.waiting_for_lighter_fill = True
+            self.logger.info(f"📋 Ready to place Lighter hedge order: {lighter_side} {filled_size} @ {price}")
+
+    def handle_lighter_order_update(self, order_data):
+        updates = order_data if isinstance(order_data, list) else [order_data]
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+
+            status = str(update.get('status', '')).upper()
+            is_ask = bool(update.get('is_ask', False))
+            side = 'sell' if is_ask else 'buy'
+
+            client_order_index = update.get('client_order_index', None)
+            filled_base_amount = Decimal(str(update.get('filled_base_amount', 0) or 0))
+            price = Decimal(str(update.get('price', 0) or 0))
+
+            if not self.waiting_for_lighter_fill:
+                continue
+            if self.current_lighter_client_order_id is not None:
+                if str(client_order_index) != str(self.current_lighter_client_order_id):
+                    continue
+
+            if status == "OPEN" and filled_base_amount > 0:
+                status = "PARTIALLY_FILLED"
+
+            if status == "FILLED" and filled_base_amount > 0:
+                self.waiting_for_lighter_fill = False
+                self.handle_lighter_hedge_result({
+                    'side': side.upper(),
+                    'filled_size': filled_base_amount,
+                    'price': price
+                })
+
+    async def setup_clients_websocket(self):
+        self.grvt_client.setup_order_update_handler(self.handle_grvt_order_update)
+        await self.grvt_client.connect()
+        self.logger.info("✅ GRVT Maker WebSocket connected")
+
+        self.lighter_client.setup_order_update_handler(self.handle_lighter_order_update)
+        await self.lighter_client.connect()
+        self.logger.info("✅ Lighter Taker WebSocket connected")
+
+        await asyncio.sleep(2)
+
     async def trading_loop(self):
-        side = self.start_side
-
-        for i in range(self.iterations):
-            if self._shutdown:
-                break
-
-            self.logger.info(f"================= Cycle {i+1}/{self.iterations} (start_side={side}) =================")
-
-            ok = await self.place_grvt_maker_order(side, self.order_quantity)
-            if not ok:
-                await asyncio.sleep(SLEEP_BETWEEN_CYCLES)
-                side = "sell" if side == "buy" else "buy"
-                continue
-
-            filled = await self.wait_grvt_fill_or_timeout()
-            if not filled:
-                await asyncio.sleep(SLEEP_BETWEEN_CYCLES)
-                side = "sell" if side == "buy" else "buy"
-                continue
-
-            hedge_side = "sell" if self.last_grvt_fill_side == "buy" else "buy"
-            hedge_qty = self.last_grvt_fill_size
-
-            ok = await self.place_lighter_market_order(hedge_side, hedge_qty)
-            if not ok:
-                self.logger.error("❌ Hedge send failed. (TODO: emergency flatten on GRVT)")
-                await asyncio.sleep(SLEEP_BETWEEN_CYCLES)
-                side = "sell" if side == "buy" else "buy"
-                continue
-
-            hedge_filled = await self.wait_lighter_fill_or_timeout()
-            if not hedge_filled:
-                self.logger.error("❌ Hedge not confirmed FILLED by WS. (TODO: emergency handling)")
-                await asyncio.sleep(SLEEP_BETWEEN_CYCLES)
-                side = "sell" if side == "buy" else "buy"
-                continue
-
-            await asyncio.sleep(SLEEP_BETWEEN_CYCLES)
-            side = "sell" if side == "buy" else "buy"
-
-    async def run(self):
-        self.logger.info(f"🚀 HedgeBot Starting: {self.ticker} | Size: {self.order_quantity} | Iter: {self.iterations}")
-        _install_signal_handlers(self)
+        self.logger.info(f"🚀 Starting GRVT/Lighter hedge bot for {self.ticker}")
 
         try:
-            await self.initialize_clients()
+            self.initialize_grvt_client()
+            self.initialize_lighter_client()
+            await self.get_contract_info()
+            self.logger.info(
+                f"Contract info loaded - GRVT: {self.grvt_contract_id}, Lighter: {self.lighter_contract_id}")
+            await self.setup_clients_websocket()
+        except Exception as e:
+            self.logger.error(f"❌ Failed to initialize: {e}")
+            return
+
+        iterations = 0
+        while iterations < self.iterations and not self.stop_flag:
+            iterations += 1
+
+            if iterations == 1:
+                side = self.start_side
+            else:
+                side = 'buy' if self.current_side == 'sell' else 'sell'
+            self.current_side = side
+
+            self.logger.info("-----------------------------------------------")
+            self.logger.info(f"🔄 Trading loop iteration {iterations}. Net P&L: {self.current_net_pnl:.2f} USD")
+            self.logger.info("-----------------------------------------------")
+
+            if abs(self.grvt_position + self.lighter_position) > self.order_quantity * Decimal('0.1'):
+                self.logger.critical(f"❌ 倉位差異過大: {self.grvt_position + self.lighter_position}. 停止交易。")
+                break
+
+            if self.grvt_position != 0 or self.lighter_position != 0:
+                self.logger.warning("倉位未清零，進行外部校準並跳過開倉。")
+                await self.fetch_current_exchange_positions()
+                await asyncio.sleep(5)
+                continue
+
+            self.is_closing = False
+            self.order_execution_complete = False
+            self.waiting_for_lighter_fill = False
+            self.grvt_order_status = None
+
+            try:
+                await self.place_grvt_open_order(side, self.order_quantity)
+
+                start_time = time.time()
+                while not self.waiting_for_lighter_fill and not self.stop_flag and (
+                        time.time() - start_time < self.open_wait_timeout):
+                    await asyncio.sleep(0.1)
+
+                if self.waiting_for_lighter_fill and not self.stop_flag:
+                    self.logger.info("GRVT filled. Executing Lighter hedge...")
+                    hedge_success = await self.place_lighter_market_order(
+                        self.current_lighter_side,
+                        self.current_lighter_quantity
+                    )
+                    if not hedge_success and self.grvt_position != 0:
+                        self.logger.warning("Hedge/Emergency Close Failed. Retrying open next cycle.")
+                        await asyncio.sleep(self.sleep_between_cycles)
+                        continue
+                elif not self.stop_flag and self.grvt_order_status not in ['FILLED', 'CANCELED']:
+                    self.logger.warning("GRVT Maker order timeout. Canceling and retrying...")
+                    if hasattr(self.grvt_client, 'cancel_all_orders'):
+                        await self.grvt_client.cancel_all_orders(self.grvt_contract_id)
+                    elif hasattr(self.grvt_client, 'cancel_order') and self.grvt_client is not None:
+                        if self.current_grvt_order_id:
+                            await self.grvt_client.cancel_order(self.current_grvt_order_id)
+                    await asyncio.sleep(self.sleep_between_cycles)
+                    continue
+
+            except Exception as e:
+                self.logger.error(f"⚠️ Error in trading loop: {e}")
+                break
+
+            if self.grvt_position != 0 or self.lighter_position != 0:
+                self.open_time = time.time()
+                self.pnl_monitor_task = asyncio.create_task(self.calculate_and_monitor_pnl())
+
+                self.logger.info(f"⏳ 雙邊對沖成功建立。等待 {self.holding_time} 秒 (或 PNL 觸發)...")
+
+                while time.time() < self.open_time + self.holding_time and not self.stop_flag and self.open_time != 0:
+                    await asyncio.sleep(1)
+
+                if self.pnl_monitor_task:
+                    self.pnl_monitor_task.cancel()
+
+                if self.open_time == 0 and not self.stop_flag:
+                    self.logger.info("⚠️ PNL 監控觸發緊急平倉，立即執行。")
+                else:
+                    self.logger.info("✅ 持倉時間已到。執行平倉。")
+
+            if self.grvt_position != 0 or self.lighter_position != 0 and not self.stop_flag:
+                await self.close_both_positions()
+
+            start_time = time.time()
+            self.is_closing = True
+            while (self.grvt_position != 0 or self.lighter_position != 0) and not self.stop_flag and (
+                    time.time() - start_time < 30):
+                await self.fetch_current_exchange_positions()
+
+                self.logger.info(
+                    f"🔄 等待平倉確認... GRVT: {self.grvt_position}, Lighter: {self.lighter_position}")
+                await asyncio.sleep(2)
+
+            if self.grvt_position != 0 or self.lighter_position != 0:
+                self.logger.critical("🚨 嚴重錯誤：平倉後倉位未清零。手動介入！")
+                self.stop_flag = True
+
+            await asyncio.sleep(self.sleep_between_cycles)
+
+    async def run(self):
+        self.setup_signal_handlers()
+        try:
             await self.trading_loop()
-            self.logger.info("🏁 Completed.")
+        except KeyboardInterrupt:
+            self.logger.info("\n🛑 Received interrupt signal...")
         finally:
-            # clean disconnect to avoid aiohttp session leaks
-            try:
-                if self.grvt_client and hasattr(self.grvt_client, "disconnect"):
-                    await self.grvt_client.disconnect()
-            except Exception:
-                pass
-            try:
-                if self.lighter_client and hasattr(self.lighter_client, "disconnect"):
-                    await self.lighter_client.disconnect()
-            except Exception:
-                pass
+            self.logger.info("🔄 Cleaning up...")
+            self.shutdown()
+            await self._disconnect_clients()
 
-    def request_shutdown(self):
-        self._shutdown = True
-        self.logger.warning("Shutdown requested...")
+    async def _disconnect_clients(self):
+        try:
+            if self.grvt_client and hasattr(self.grvt_client, "disconnect"):
+                await self.grvt_client.disconnect()
+        except Exception:
+            pass
+        try:
+            if self.lighter_client and hasattr(self.lighter_client, "disconnect"):
+                await self.lighter_client.disconnect()
+            elif self.lighter_client and hasattr(self.lighter_client, "close"):
+                result = self.lighter_client.close()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass
 
-
-def _install_signal_handlers(bot: HedgeBot):
-    def handler(signum, frame):
-        bot.request_shutdown()
-
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
+    def setup_signal_handlers(self):
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
