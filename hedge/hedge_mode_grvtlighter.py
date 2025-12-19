@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 HEDGE_TIMEOUT = 10
 HOLDING_TIME = 180
-MAX_RISK_USD = Decimal('30')
+MAX_RISK_USD = Decimal("30")
 
 
 class Config:
@@ -36,11 +36,12 @@ def _normalize_order_result(res: Any) -> Tuple[bool, Optional[str], Optional[str
     Supports:
       - OrderResult: has .success, .order_id, .error_message
       - OrderInfo: has .order_id, .status
-      - dict: keys may be success/order_id/error_message/id/client_order_index
+      - dict: keys may be success/order_id/error_message/id/client_order_index/clientOrderIndex/client_order_id/clientOrderId
     """
     if res is None:
         return False, None, "order result is None"
 
+    # dict response
     if isinstance(res, dict):
         ok = bool(res.get("success", True))
         oid = (
@@ -56,12 +57,14 @@ def _normalize_order_result(res: Any) -> Tuple[bool, Optional[str], Optional[str
             err = "order failed (dict)"
         return ok, str(oid) if oid is not None else None, err
 
+    # objects with `.success`
     if hasattr(res, "success"):
         ok = bool(getattr(res, "success"))
         oid = getattr(res, "order_id", None)
         err = getattr(res, "error_message", None)
         return ok, str(oid) if oid is not None else None, err
 
+    # objects with `.order_id`
     if hasattr(res, "order_id"):
         oid = getattr(res, "order_id", None)
         return True, str(oid) if oid is not None else None, None
@@ -70,7 +73,7 @@ def _normalize_order_result(res: Any) -> Tuple[bool, Optional[str], Optional[str
 
 
 class HedgeBot:
-    """Trading bot that places post-only orders on GRVT and hedges with market orders on Lighter."""
+    """Trading bot that opens on GRVT and hedges with market orders on Lighter."""
 
     def __init__(
         self,
@@ -78,7 +81,7 @@ class HedgeBot:
         order_quantity: Decimal,
         fill_timeout: int = 5,
         iterations: int = 20,
-        start_side: str = 'buy',
+        start_side: str = "buy",
         holding_time: int = HOLDING_TIME,
         hedge_timeout: int = HEDGE_TIMEOUT,
         max_risk_usd: Decimal = MAX_RISK_USD,
@@ -95,16 +98,16 @@ class HedgeBot:
         self.holding_time = holding_time
         self.hedge_timeout = hedge_timeout
         self.max_risk_usd = Decimal(str(max_risk_usd))
-        self.sleep_between_cycles = sleep_between_cycles
+        self.sleep_between_cycles = float(sleep_between_cycles)
         self.open_wait_timeout = open_wait_timeout if open_wait_timeout is not None else fill_timeout
         self.grvt_force_market = grvt_force_market
 
-        self.grvt_position = Decimal('0')
-        self.lighter_position = Decimal('0')
-        self.grvt_open_price = Decimal('0')
-        self.lighter_open_price = Decimal('0')
+        self.grvt_position = Decimal("0")
+        self.lighter_position = Decimal("0")
+        self.grvt_open_price = Decimal("0")
+        self.lighter_open_price = Decimal("0")
         self.open_time = 0.0
-        self.current_net_pnl = Decimal('0')
+        self.current_net_pnl = Decimal("0")
 
         self.is_closing = False
 
@@ -116,21 +119,16 @@ class HedgeBot:
         self._setup_logger()
 
         self.stop_flag = False
-        self.order_counter = 0
 
         self.grvt_client = None
         self.grvt_contract_id = None
         self.grvt_tick_size = None
         self.grvt_order_status = None
-        self.grvt_best_bid = None
-        self.grvt_best_ask = None
         self.current_grvt_order_id = None
 
         self.lighter_client = None
         self.lighter_contract_id = None
         self.lighter_tick_size = None
-        self.lighter_best_bid = None
-        self.lighter_best_ask = None
 
         self.waiting_for_lighter_fill = False
         self.order_execution_complete = False
@@ -140,26 +138,28 @@ class HedgeBot:
 
         self.pnl_monitor_task = None
 
+    # ---------------- logging / shutdown ----------------
     def _setup_logger(self):
         self.logger = logging.getLogger(f"hedge_bot_{self.ticker}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 
-        logging.getLogger('urllib3').setLevel(logging.WARNING)
-        logging.getLogger('requests').setLevel(logging.WARNING)
-        logging.getLogger('websockets').setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests").setLevel(logging.WARNING)
+        logging.getLogger("websockets").setLevel(logging.WARNING)
 
         file_handler = logging.FileHandler(self.log_filename)
         file_handler.setLevel(logging.INFO)
-        file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         file_handler.setFormatter(file_formatter)
         self.logger.addHandler(file_handler)
 
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
+        console_formatter = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
         console_handler.setFormatter(console_formatter)
         self.logger.addHandler(console_handler)
+
         self.logger.propagate = False
 
     def shutdown(self, signum=None, frame=None):
@@ -183,22 +183,23 @@ class HedgeBot:
 
     def _initialize_csv_file(self):
         if not os.path.exists(self.csv_filename):
-            with open(self.csv_filename, 'w', newline='') as csvfile:
+            with open(self.csv_filename, "w", newline="") as csvfile:
                 writer = csv.writer(csvfile)
-                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity'])
+                writer.writerow(["exchange", "timestamp", "side", "price", "quantity"])
 
     def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str):
         timestamp = datetime.now(pytz.UTC).isoformat()
-        with open(self.csv_filename, 'a', newline='') as csvfile:
+        with open(self.csv_filename, "a", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow([exchange, timestamp, side, price, quantity])
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
 
+    # ---------------- WS handlers ----------------
     def handle_lighter_hedge_result(self, order_data):
         try:
-            side = order_data.get('side', '').upper()
-            filled_size = Decimal(order_data.get('filled_size', '0'))
-            avg_price = Decimal(order_data.get('price', '0'))
+            side = order_data.get("side", "").upper()
+            filled_size = Decimal(order_data.get("filled_size", "0"))
+            avg_price = Decimal(order_data.get("price", "0"))
 
             if filled_size == 0:
                 return
@@ -211,33 +212,114 @@ class HedgeBot:
             self.lighter_open_price = avg_price
 
             self.logger.info(f"📊 Lighter hedge FILLED: {side} {filled_size} @ {avg_price}")
-            self.log_trade_to_csv(exchange='Lighter', side=side, price=str(avg_price), quantity=str(filled_size))
+            self.log_trade_to_csv(exchange="Lighter", side=side, price=str(avg_price), quantity=str(filled_size))
             self.order_execution_complete = True
 
             if self.is_closing:
-                self.lighter_position = Decimal('0')
+                self.lighter_position = Decimal("0")
                 self.logger.info("✅ Lighter Taker 倉位已強制清零 (平倉完成)")
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter hedge result: {e}")
 
+    def handle_grvt_order_update(self, order_data):
+        if self.stop_flag:
+            self.logger.warning("Bot is shutting down, ignoring incoming FILLED order to prevent hedge.")
+            return
+
+        updates = order_data if isinstance(order_data, list) else [order_data]
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+
+            side = update.get("side", "").lower()
+            filled_size = Decimal(update.get("filled_size", "0"))
+            price = Decimal(update.get("price", "0"))
+            status = update.get("status")
+
+            if status != "FILLED":
+                self.grvt_order_status = status
+                continue
+
+            if self.is_closing:
+                self.logger.info(f"✅ GRVT 平倉成交: {side} {filled_size} @ {price} [Cleaned]")
+                self.log_trade_to_csv(exchange="GRVT", side=f"CLOSE_{side}", price=str(price), quantity=str(filled_size))
+                self.grvt_position = Decimal("0")
+                self.is_closing = False
+                return
+
+            if side == "buy":
+                self.grvt_position += filled_size
+                lighter_side = "sell"
+            else:
+                self.grvt_position -= filled_size
+                lighter_side = "buy"
+
+            self.grvt_open_price = price
+            self.grvt_order_status = "FILLED"
+
+            self.log_trade_to_csv(exchange="GRVT", side=side, price=str(price), quantity=str(filled_size))
+
+            self.current_lighter_side = lighter_side
+            self.current_lighter_quantity = filled_size
+            self.waiting_for_lighter_fill = True
+            self.logger.info(f"📋 Ready to place Lighter hedge order: {lighter_side} {filled_size} @ {price}")
+
+    def handle_lighter_order_update(self, order_data):
+        updates = order_data if isinstance(order_data, list) else [order_data]
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+
+            status = str(update.get("status", "")).upper()
+            is_ask = bool(update.get("is_ask", False))
+            side = "sell" if is_ask else "buy"
+
+            client_order_index = update.get("client_order_index", None)
+            filled_base_amount = Decimal(str(update.get("filled_base_amount", 0) or 0))
+            price = Decimal(str(update.get("price", 0) or 0))
+
+            if not self.waiting_for_lighter_fill:
+                continue
+
+            if self.current_lighter_client_order_id is not None:
+                if str(client_order_index) != str(self.current_lighter_client_order_id):
+                    continue
+
+            if status == "OPEN" and filled_base_amount > 0:
+                status = "PARTIALLY_FILLED"
+
+            if status == "FILLED" and filled_base_amount > 0:
+                self.waiting_for_lighter_fill = False
+                self.handle_lighter_hedge_result(
+                    {
+                        "side": side.upper(),
+                        "filled_size": filled_base_amount,
+                        "price": price,
+                    }
+                )
+
+    # ---------------- exchange actions ----------------
     async def close_grvt_market_position(self, direction: str, quantity: Decimal):
         if not self.grvt_client:
             return
 
+        if quantity <= 0:
+            return
+
         self.logger.critical(
-            f"🚨 Executing EMERGENCY MARKET CLOSE on GRVT (Fallback to aggressive Limit): {direction} {quantity}")
+            f"🚨 Executing EMERGENCY MARKET CLOSE on GRVT (Fallback to aggressive Limit): {direction} {quantity}"
+        )
 
         try:
+            # use open_order as fallback aggressive close
             order_result = await self.grvt_client.place_open_order(
-                contract_id=self.grvt_contract_id,
-                quantity=quantity,
-                direction=direction.lower()
+                contract_id=self.grvt_contract_id, quantity=quantity, direction=direction.lower()
             )
 
             ok, _, err = _normalize_order_result(order_result)
             if ok:
-                self.grvt_position = Decimal('0')
+                self.grvt_position = Decimal("0")
                 self.logger.critical("✅ GRVT單邊倉位已成功發送平倉，內部狀態已清零。")
             else:
                 self.logger.critical(f"❌ 嚴重錯誤：GRVT平倉失敗: {err}")
@@ -247,7 +329,7 @@ class HedgeBot:
             self.logger.critical(f"❌ 嚴重錯誤：GRVT平倉異常: {e}")
             self.stop_flag = True
 
-    async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal):
+    async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal) -> bool:
         if not self.lighter_client:
             return False
 
@@ -255,41 +337,42 @@ class HedgeBot:
         self.current_lighter_client_order_id = None
 
         try:
+            # direction preferred, side fallback
             try:
                 order_result = await self.lighter_client.place_market_order(
                     contract_id=self.lighter_contract_id,
                     quantity=quantity,
-                    direction=lighter_side.lower()
+                    direction=lighter_side.lower(),
                 )
             except TypeError:
                 order_result = await self.lighter_client.place_market_order(
                     contract_id=self.lighter_contract_id,
                     quantity=quantity,
-                    side=lighter_side.lower()
+                    side=lighter_side.lower(),
                 )
 
             if order_result is None:
                 self.logger.error("❌ Lighter Taker order failed: order_result is None")
-                grvt_side_to_close = 'sell' if self.grvt_position > 0 else 'buy'
+                grvt_side_to_close = "sell" if self.grvt_position > 0 else "buy"
                 await self.close_grvt_market_position(grvt_side_to_close, abs(self.grvt_position))
                 return False
 
         except Exception:
             self.logger.error("❌ Lighter Taker order exception", exc_info=True)
-            grvt_side_to_close = 'sell' if self.grvt_position > 0 else 'buy'
+            grvt_side_to_close = "sell" if self.grvt_position > 0 else "buy"
             await self.close_grvt_market_position(grvt_side_to_close, abs(self.grvt_position))
             return False
 
         ok, oid, err = _normalize_order_result(order_result)
         if not ok:
             self.logger.error(f"❌ Lighter Taker order failed: {err}")
-            grvt_side_to_close = 'sell' if self.grvt_position > 0 else 'buy'
+            grvt_side_to_close = "sell" if self.grvt_position > 0 else "buy"
             await self.close_grvt_market_position(grvt_side_to_close, abs(self.grvt_position))
             return False
 
         if oid is None:
             self.logger.error("❌ Lighter hedge returned no order_id/client_order_index; cannot track fills.")
-            grvt_side_to_close = 'sell' if self.grvt_position > 0 else 'buy'
+            grvt_side_to_close = "sell" if self.grvt_position > 0 else "buy"
             await self.close_grvt_market_position(grvt_side_to_close, abs(self.grvt_position))
             return False
 
@@ -302,7 +385,7 @@ class HedgeBot:
             return True
 
         self.logger.error(f"❌ Lighter Taker 對沖失敗或超時 ({self.hedge_timeout}s)")
-        grvt_side_to_close = 'sell' if self.grvt_position > 0 else 'buy'
+        grvt_side_to_close = "sell" if self.grvt_position > 0 else "buy"
         await self.close_grvt_market_position(grvt_side_to_close, abs(self.grvt_position))
         return False
 
@@ -324,7 +407,7 @@ class HedgeBot:
             await asyncio.sleep(0.5)
 
             if self.grvt_position == 0 or self.lighter_position == 0 or self.open_time == 0:
-                self.current_net_pnl = Decimal('0')
+                self.current_net_pnl = Decimal("0")
                 continue
 
             try:
@@ -357,8 +440,13 @@ class HedgeBot:
 
     def initialize_grvt_client(self):
         if self.grvt_client is None:
-            config_dict = {'ticker': self.ticker, 'contract_id': '', 'quantity': self.order_quantity,
-                           'tick_size': Decimal('0.01'), 'close_order_side': 'sell'}
+            config_dict = {
+                "ticker": self.ticker,
+                "contract_id": "",
+                "quantity": self.order_quantity,
+                "tick_size": Decimal("0.01"),
+                "close_order_side": "sell",
+            }
             config = Config(config_dict)
             self.grvt_client = GrvtClient(config)
             self.logger.info("✅ GRVT Maker client initialized successfully")
@@ -366,8 +454,13 @@ class HedgeBot:
 
     def initialize_lighter_client(self):
         if self.lighter_client is None:
-            config_dict = {'ticker': self.ticker, 'contract_id': '', 'quantity': self.order_quantity,
-                           'tick_size': Decimal('0.01'), 'close_order_side': 'sell'}
+            config_dict = {
+                "ticker": self.ticker,
+                "contract_id": "",
+                "quantity": self.order_quantity,
+                "tick_size": Decimal("0.01"),
+                "close_order_side": "sell",
+            }
             config = Config(config_dict)
             self.lighter_client = LighterClient(config)
             self.logger.info("✅ Lighter Taker client initialized successfully")
@@ -377,7 +470,10 @@ class HedgeBot:
         self.grvt_contract_id, self.grvt_tick_size = await self.grvt_client.get_contract_attributes()
         self.lighter_contract_id, self.lighter_tick_size = await self.lighter_client.get_contract_attributes()
 
-        if self.order_quantity < self.grvt_client.config.quantity or self.order_quantity < self.lighter_client.config.quantity:
+        if (
+            self.order_quantity < self.grvt_client.config.quantity
+            or self.order_quantity < self.lighter_client.config.quantity
+        ):
             raise ValueError("Order quantity is less than minimum quantity on one of the exchanges.")
 
     async def fetch_current_exchange_positions(self):
@@ -385,10 +481,10 @@ class HedgeBot:
             grvt_real_pos = await self.grvt_client.get_account_positions()
             lighter_real_pos = await self.lighter_client.get_account_positions()
 
-            if abs(grvt_real_pos) < self.grvt_client.config.quantity * Decimal('0.5'):
-                self.grvt_position = Decimal('0')
-            if abs(lighter_real_pos) < self.lighter_client.config.quantity * Decimal('0.5'):
-                self.lighter_position = Decimal('0')
+            if abs(grvt_real_pos) < self.grvt_client.config.quantity * Decimal("0.5"):
+                self.grvt_position = Decimal("0")
+            if abs(lighter_real_pos) < self.lighter_client.config.quantity * Decimal("0.5"):
+                self.lighter_position = Decimal("0")
 
             self.logger.info(f"🔄 外部倉位檢查完成。GRVT: {self.grvt_position}, Lighter: {self.lighter_position}")
 
@@ -399,11 +495,19 @@ class HedgeBot:
         if self.grvt_force_market:
             self.logger.warning(f"⚠️ GRVT FORCE MARKET enabled: {side} {quantity}")
             try:
-                await self.grvt_client.place_market_order(
-                    contract_id=self.grvt_contract_id,
-                    quantity=quantity,
-                    side=side.lower()
-                )
+                # direction preferred, side fallback
+                try:
+                    await self.grvt_client.place_market_order(
+                        contract_id=self.grvt_contract_id,
+                        quantity=quantity,
+                        direction=side.lower(),
+                    )
+                except TypeError:
+                    await self.grvt_client.place_market_order(
+                        contract_id=self.grvt_contract_id,
+                        quantity=quantity,
+                        side=side.lower(),
+                    )
             except Exception as e:
                 raise Exception(f"Failed to place GRVT market order: {e}")
 
@@ -414,13 +518,14 @@ class HedgeBot:
         order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
             quantity=quantity,
-            direction=side.lower()
+            direction=side.lower(),
         )
 
         ok, oid, err = _normalize_order_result(order_result)
         if ok:
             self.current_grvt_order_id = oid
-            return oid, getattr(order_result, 'price', None)
+            return oid, getattr(order_result, "price", None)
+
         raise Exception(f"Failed to place order: {err}")
 
     async def close_both_positions(self):
@@ -435,8 +540,8 @@ class HedgeBot:
 
         self.is_closing = True
 
-        grvt_close_side = 'sell' if self.grvt_position > 0 else 'buy'
-        lighter_close_side = 'sell' if self.lighter_position > 0 else 'buy'
+        grvt_close_side = "sell" if self.grvt_position > 0 else "buy"
+        lighter_close_side = "sell" if self.lighter_position > 0 else "buy"
 
         self.logger.info(f"Closing GRVT Market: {grvt_close_side} {grvt_qty}")
         await self.close_grvt_market_position(grvt_close_side, grvt_qty)
@@ -449,82 +554,6 @@ class HedgeBot:
 
         await asyncio.sleep(5)
         self.is_closing = False
-
-    def handle_grvt_order_update(self, order_data):
-        if self.stop_flag:
-            self.logger.warning("Bot is shutting down, ignoring incoming FILLED order to prevent hedge.")
-            return
-
-        updates = order_data if isinstance(order_data, list) else [order_data]
-        for update in updates:
-            if not isinstance(update, dict):
-                continue
-
-            side = update.get('side', '').lower()
-            filled_size = Decimal(update.get('filled_size', '0'))
-            price = Decimal(update.get('price', '0'))
-            status = update.get('status')
-
-            if status != 'FILLED':
-                self.grvt_order_status = status
-                continue
-
-            if self.is_closing:
-                self.logger.info(f"✅ GRVT 平倉成交: {side} {filled_size} @ {price} [Cleaned]")
-                self.log_trade_to_csv(exchange='GRVT', side=f"CLOSE_{side}", price=str(price),
-                                      quantity=str(filled_size))
-
-                self.grvt_position = Decimal('0')
-                self.is_closing = False
-                return
-
-            if side == 'buy':
-                self.grvt_position += filled_size
-                lighter_side = 'sell'
-            else:
-                self.grvt_position -= filled_size
-                lighter_side = 'buy'
-
-            self.grvt_open_price = price
-            self.grvt_order_status = 'FILLED'
-
-            self.log_trade_to_csv(exchange='GRVT', side=side, price=str(price), quantity=str(filled_size))
-
-            self.current_lighter_side = lighter_side
-            self.current_lighter_quantity = filled_size
-            self.waiting_for_lighter_fill = True
-            self.logger.info(f"📋 Ready to place Lighter hedge order: {lighter_side} {filled_size} @ {price}")
-
-    def handle_lighter_order_update(self, order_data):
-        updates = order_data if isinstance(order_data, list) else [order_data]
-        for update in updates:
-            if not isinstance(update, dict):
-                continue
-
-            status = str(update.get('status', '')).upper()
-            is_ask = bool(update.get('is_ask', False))
-            side = 'sell' if is_ask else 'buy'
-
-            client_order_index = update.get('client_order_index', None)
-            filled_base_amount = Decimal(str(update.get('filled_base_amount', 0) or 0))
-            price = Decimal(str(update.get('price', 0) or 0))
-
-            if not self.waiting_for_lighter_fill:
-                continue
-            if self.current_lighter_client_order_id is not None:
-                if str(client_order_index) != str(self.current_lighter_client_order_id):
-                    continue
-
-            if status == "OPEN" and filled_base_amount > 0:
-                status = "PARTIALLY_FILLED"
-
-            if status == "FILLED" and filled_base_amount > 0:
-                self.waiting_for_lighter_fill = False
-                self.handle_lighter_hedge_result({
-                    'side': side.upper(),
-                    'filled_size': filled_base_amount,
-                    'price': price
-                })
 
     async def setup_clients_websocket(self):
         self.grvt_client.setup_order_update_handler(self.handle_grvt_order_update)
@@ -544,8 +573,7 @@ class HedgeBot:
             self.initialize_grvt_client()
             self.initialize_lighter_client()
             await self.get_contract_info()
-            self.logger.info(
-                f"Contract info loaded - GRVT: {self.grvt_contract_id}, Lighter: {self.lighter_contract_id}")
+            self.logger.info(f"Contract info loaded - GRVT: {self.grvt_contract_id}, Lighter: {self.lighter_contract_id}")
             await self.setup_clients_websocket()
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize: {e}")
@@ -558,14 +586,14 @@ class HedgeBot:
             if iterations == 1:
                 side = self.start_side
             else:
-                side = 'buy' if self.current_side == 'sell' else 'sell'
+                side = "buy" if self.current_side == "sell" else "sell"
             self.current_side = side
 
             self.logger.info("-----------------------------------------------")
             self.logger.info(f"🔄 Trading loop iteration {iterations}. Net P&L: {self.current_net_pnl:.2f} USD")
             self.logger.info("-----------------------------------------------")
 
-            if abs(self.grvt_position + self.lighter_position) > self.order_quantity * Decimal('0.1'):
+            if abs(self.grvt_position + self.lighter_position) > self.order_quantity * Decimal("0.1"):
                 self.logger.critical(f"❌ 倉位差異過大: {self.grvt_position + self.lighter_position}. 停止交易。")
                 break
 
@@ -584,26 +612,29 @@ class HedgeBot:
                 await self.place_grvt_open_order(side, self.order_quantity)
 
                 start_time = time.time()
-                while not self.waiting_for_lighter_fill and not self.stop_flag and (
-                        time.time() - start_time < self.open_wait_timeout):
+                while (
+                    not self.waiting_for_lighter_fill
+                    and not self.stop_flag
+                    and (time.time() - start_time < self.open_wait_timeout)
+                ):
                     await asyncio.sleep(0.1)
 
                 if self.waiting_for_lighter_fill and not self.stop_flag:
                     self.logger.info("GRVT filled. Executing Lighter hedge...")
                     hedge_success = await self.place_lighter_market_order(
                         self.current_lighter_side,
-                        self.current_lighter_quantity
+                        self.current_lighter_quantity,
                     )
-                    if not hedge_success and self.grvt_position != 0:
-                        self.logger.warning("Hedge failed -> emergency close triggered.")
+                    if not hedge_success:
+                        self.logger.warning("Hedge failed -> emergency close triggered. Stop bot to avoid naked exposure.")
                         break
-                elif not self.stop_flag and self.grvt_order_status not in ['FILLED', 'CANCELED']:
+
+                elif not self.stop_flag and self.grvt_order_status not in ["FILLED", "CANCELED"]:
                     self.logger.warning("GRVT Maker order timeout. Canceling and retrying...")
-                    if hasattr(self.grvt_client, 'cancel_all_orders'):
+                    if hasattr(self.grvt_client, "cancel_all_orders"):
                         await self.grvt_client.cancel_all_orders(self.grvt_contract_id)
-                    elif hasattr(self.grvt_client, 'cancel_order') and self.grvt_client is not None:
-                        if self.current_grvt_order_id:
-                            await self.grvt_client.cancel_order(self.current_grvt_order_id)
+                    elif hasattr(self.grvt_client, "cancel_order") and self.current_grvt_order_id:
+                        await self.grvt_client.cancel_order(self.current_grvt_order_id)
                     await asyncio.sleep(self.sleep_between_cycles)
                     continue
 
@@ -628,17 +659,18 @@ class HedgeBot:
                 else:
                     self.logger.info("✅ 持倉時間已到。執行平倉。")
 
-            if self.grvt_position != 0 or self.lighter_position != 0 and not self.stop_flag:
+            if (self.grvt_position != 0 or self.lighter_position != 0) and not self.stop_flag:
                 await self.close_both_positions()
 
             start_time = time.time()
             self.is_closing = True
-            while (self.grvt_position != 0 or self.lighter_position != 0) and not self.stop_flag and (
-                    time.time() - start_time < 30):
+            while (
+                (self.grvt_position != 0 or self.lighter_position != 0)
+                and not self.stop_flag
+                and (time.time() - start_time < 30)
+            ):
                 await self.fetch_current_exchange_positions()
-
-                self.logger.info(
-                    f"🔄 等待平倉確認... GRVT: {self.grvt_position}, Lighter: {self.lighter_position}")
+                self.logger.info(f"🔄 等待平倉確認... GRVT: {self.grvt_position}, Lighter: {self.lighter_position}")
                 await asyncio.sleep(2)
 
             if self.grvt_position != 0 or self.lighter_position != 0:
@@ -664,6 +696,7 @@ class HedgeBot:
                 await self.grvt_client.disconnect()
         except Exception:
             pass
+
         try:
             if self.lighter_client and hasattr(self.lighter_client, "disconnect"):
                 await self.lighter_client.disconnect()
