@@ -19,17 +19,17 @@ from datetime import datetime
 import pytz
 
 # 確保可以找到 exchanges 模組 (必須在文件開頭)
-# 如果您在 launch_hedge.py 中處理了這個問題，可以註釋掉這行
-# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # --- 策略常數 ---
 HEDGE_TIMEOUT = 10  # Taker 腿對沖超時時間 (秒)
-HOLDING_TIME = 300  # 預期持倉時間 (5 分鐘)
+HOLDING_TIME = 180  # 預期持倉時間 (5 分鐘)
 MAX_RISK_USD = Decimal('30')  # 最大可容忍淨浮動虧損 (USD)
 
 
 class Config:
     """Simple config class to wrap dictionary for exchange clients."""
+
     def __init__(self, config_dict):
         for key, value in config_dict.items():
             setattr(self, key, value)
@@ -38,21 +38,25 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on GRVT and hedges with market orders on Aster."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, start_side: str = 'buy'):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20,
+                 start_side: str = 'buy'):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
-        self.iterations = iterations #循環
-        self.start_side = start_side  # 儲存起始方向
-        self.current_side = start_side  # 用於第一個循環
+        self.iterations = iterations
+        self.start_side = start_side
+        self.current_side = start_side
 
         # --- 倉位與價格狀態 ---
         self.grvt_position = Decimal('0')
         self.aster_position = Decimal('0')
-        self.grvt_open_price = Decimal('0')  # Maker 腿的平均開倉價
-        self.aster_open_price = Decimal('0')  # Taker 腿的平均開倉價
-        self.open_time = 0.0  # 記錄對沖倉位建立的時間 (用於持倉計時)
-        self.current_net_pnl = Decimal('0')  # 實時淨浮動損益
+        self.grvt_open_price = Decimal('0')
+        self.aster_open_price = Decimal('0')
+        self.open_time = 0.0
+        self.current_net_pnl = Decimal('0')
+
+        # --- 邏輯狀態旗標 ---
+        self.is_closing = False  # 保持此旗標，用於 WS 處理
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -95,19 +99,16 @@ class HedgeBot:
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 
-        # Disable noisy external library logs
         logging.getLogger('urllib3').setLevel(logging.WARNING)
         logging.getLogger('requests').setLevel(logging.WARNING)
         logging.getLogger('websockets').setLevel(logging.WARNING)
 
-        # File Handler
         file_handler = logging.FileHandler(self.log_filename)
         file_handler.setLevel(logging.INFO)
         file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
         self.logger.addHandler(file_handler)
 
-        # Console Handler
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
         console_formatter = logging.Formatter('%(levelname)s:%(name)s:%(message)s')
@@ -158,9 +159,10 @@ class HedgeBot:
 
             if filled_size == 0: return
 
+            # 正常更新倉位
             if side == "SELL":
                 self.aster_position -= filled_size
-            else:
+            else:  # BUY
                 self.aster_position += filled_size
 
             self.aster_open_price = avg_price
@@ -169,32 +171,41 @@ class HedgeBot:
             self.log_trade_to_csv(exchange='Aster', side=side, price=str(avg_price), quantity=str(filled_size))
             self.order_execution_complete = True
 
+            # 🚨 關鍵：平倉時，將 Aster 倉位強制設為 0
+            if self.is_closing:
+                self.aster_position = Decimal('0')
+                self.logger.info("✅ Aster Taker 倉位已強制清零 (平倉完成)")
+
+
         except Exception as e:
             self.logger.error(f"Error handling Aster hedge result: {e}")
 
     # --- 步驟 2 輔助函式：GRVT 市價平倉單邊倉位 ---
     async def close_grvt_market_position(self, direction: str, quantity: Decimal):
-        """Place a Market Order on GRVT to close the remaining single-side position."""
+        """Place a Market Order on GRVT (using place_open_order fallback) to close the remaining single-side position."""
         if not self.grvt_client: return
 
-        self.logger.critical(f"🚨 Executing EMERGENCY MARKET CLOSE on GRVT: {direction} {quantity}")
+        self.logger.critical(
+            f"🚨 Executing EMERGENCY MARKET CLOSE on GRVT (Fallback to aggressive Limit): {direction} {quantity}")
 
         try:
-            order_result = await self.grvt_client.place_market_order(
+            # 🌟 修正：使用 place_open_order 進行積極的 Taker 執行
+            order_result = await self.grvt_client.place_open_order(
                 contract_id=self.grvt_contract_id,
                 quantity=quantity,
                 direction=direction.lower()
             )
 
             if order_result.success:
+                # 🚨 關鍵修正：Market Close 應在成功發送後立即確認倉位清零
                 self.grvt_position = Decimal('0')
-                self.logger.critical("✅ GRVT單邊倉位已成功市價平倉。")
+                self.logger.critical("✅ GRVT單邊倉位已成功發送平倉，內部狀態已清零。")
             else:
-                self.logger.critical(f"❌ 嚴重錯誤：GRVT市價平倉失敗: {order_result.error_message}")
+                self.logger.critical(f"❌ 嚴重錯誤：GRVT平倉失敗: {order_result.error_message}")
                 self.stop_flag = True
 
         except Exception as e:
-            self.logger.critical(f"❌ 嚴重錯誤：GRVT市價平倉異常: {e}")
+            self.logger.critical(f"❌ 嚴重錯誤：GRVT平倉異常: {e}")
             self.stop_flag = True
 
     # --- Aster Taker 執行邏輯 ---
@@ -218,7 +229,7 @@ class HedgeBot:
 
         if order_info and order_info.status == 'FILLED':
             self.handle_aster_hedge_result({
-                'side': order_info.side, # 使用 order_info.side 確保準確
+                'side': order_info.side,
                 'filled_size': order_info.filled_size,
                 'price': order_info.price
             })
@@ -249,7 +260,7 @@ class HedgeBot:
 
     # --- PNL 監控函式 ---
     async def calculate_and_monitor_pnl(self):
-        """Monitors P&L and triggers emergency close if risk limit is breached."""
+        # ... (PNL 邏輯不變) ...
         while not self.stop_flag:
             await asyncio.sleep(0.5)
 
@@ -263,13 +274,11 @@ class HedgeBot:
 
                 if grvt_bid == 0 or aster_bid == 0 or grvt_bid >= grvt_ask or aster_bid >= aster_ask: continue
 
-                # 計算 GRVT P&L (Maker 腿)
                 if self.grvt_position > 0:
                     grvt_pnl = self.grvt_position * (grvt_bid - self.grvt_open_price)
                 else:
                     grvt_pnl = self.grvt_position * (self.grvt_open_price - grvt_ask)
 
-                # 計算 Aster P&L (Taker 腿)
                 if self.aster_position > 0:
                     aster_pnl = self.aster_position * (aster_bid - self.aster_open_price)
                 else:
@@ -313,6 +322,24 @@ class HedgeBot:
         if self.order_quantity < self.grvt_client.config.quantity or self.order_quantity < self.aster_client.config.quantity:
             raise ValueError("Order quantity is less than minimum quantity on one of the exchanges.")
 
+    # --- 🌟 修正點: 外部倉位獲取 (用於校準) ---
+    async def fetch_current_exchange_positions(self):
+        """Fetch real-time positions from both exchanges to correct internal state."""
+        try:
+            grvt_real_pos = await self.grvt_client.get_account_positions()  # 假設返回淨頭寸
+            aster_real_pos = await self.aster_client.get_account_positions()
+
+            # 只有當實際倉位遠小於一個訂單量時才清零內部狀態
+            if abs(grvt_real_pos) < self.grvt_client.config.quantity * Decimal('0.5'):
+                self.grvt_position = Decimal('0')
+            if abs(aster_real_pos) < self.aster_client.config.quantity * Decimal('0.5'):
+                self.aster_position = Decimal('0')
+
+            self.logger.info(f"🔄 外部倉位檢查完成。GRVT: {self.grvt_position}, Aster: {self.aster_position}")
+
+        except Exception as e:
+            self.logger.error(f"❌ 無法獲取外部倉位: {e}")
+
     # --- GRVT Post-Only 輔助函式 (僅開倉) ---
     async def place_grvt_open_order(self, side: str, quantity: Decimal):
         """Place an open order on GRVT using client's logic (includes Post-Only retry)."""
@@ -341,25 +368,37 @@ class HedgeBot:
             self.logger.warning("倉位已經為零，跳過平倉。")
             return
 
+        # 🚨 關鍵：設置平倉狀態旗標，讓 WS Handler 知道這是平倉
+        self.is_closing = True
+
         grvt_close_side = 'sell' if self.grvt_position > 0 else 'buy'
         aster_close_side = 'sell' if self.aster_position > 0 else 'buy'
 
-        # 1. GRVT (Maker) 平倉 Maker 訂單
-        self.logger.info(f"Closing GRVT Maker: {grvt_close_side} {grvt_qty}")
-        await self.place_grvt_open_order(grvt_close_side, grvt_qty)
+        # 1. GRVT (Market) 平倉 -> 🌟 修正點：改為 Market Close
+        self.logger.info(f"Closing GRVT Market: {grvt_close_side} {grvt_qty}")
+        await self.close_grvt_market_position(grvt_close_side, grvt_qty)  # 調用 Market Close
 
         # 2. Aster (Taker) 平倉 Market 訂單
         self.logger.info(f"Closing Aster Taker: {aster_close_side} {aster_qty}")
         await self.place_aster_market_order(aster_close_side, aster_qty)
 
-        self.grvt_position = Decimal('0')
-        self.aster_position = Decimal('0')
-        self.logger.info("✅ 雙邊平倉指令已發送完成。")
+        # 🚨 移除手動清零，但等待 WS 完成
+        self.logger.info("✅ 雙邊平倉指令已發送完成，等待 WS 確認清零。")
         self.order_execution_complete = True
+
+        # 🚨 關鍵：平倉後，強制等待 5 秒，確保所有平倉信號傳回
+        await asyncio.sleep(5)
+        self.is_closing = False  # 重置旗標
 
     # --- GRVT 訂單更新處理 (Websocket Handler) ---
     def handle_grvt_order_update(self, order_data):
         """Handle GRVT order updates from WebSocket."""
+
+        # 🚨 修正點: 緊急停止檢查 and 平倉時忽略開倉邏輯
+        if self.stop_flag:
+            self.logger.warning("Bot is shutting down, ignoring incoming FILLED order to prevent hedge.")
+            return
+
         side = order_data.get('side', '').lower()
         filled_size = Decimal(order_data.get('filled_size', '0'))
         price = Decimal(order_data.get('price', '0'))
@@ -369,6 +408,18 @@ class HedgeBot:
             self.grvt_order_status = status
             return
 
+        # 判斷是否為平倉成交
+        if self.is_closing:
+            # 這是平倉訂單成交
+            self.logger.info(f"✅ GRVT 平倉成交: {side} {filled_size} @ {price} [Cleaned]")
+            self.log_trade_to_csv(exchange='GRVT', side=f"CLOSE_{side}", price=str(price), quantity=str(filled_size))
+
+            # 🚨 核心修正：平倉成交，將 GRVT 倉位設為 0
+            self.grvt_position = Decimal('0')
+            self.is_closing = False  # 重置旗標
+            return
+
+            # --- 開倉邏輯 (ONLY IF NOT CLOSING) ---
         if side == 'buy':
             self.grvt_position += filled_size
             aster_side = 'sell'
@@ -415,16 +466,14 @@ class HedgeBot:
         iterations = 0
         while iterations < self.iterations and not self.stop_flag:
             iterations += 1
-            # 決定開倉方向 (現在使用 self.current_side)
-            if iterations == 1:
-                # 第一個循環使用傳入的 start_side
-                side = self.current_side
-            else:
-                # 從第二個循環開始，交替方向
-                side = 'buy' if self.current_side == 'sell' else 'sell'
 
-            # 更新下一個循環的方向 (為了交替)
+            # 決定開倉方向 (修正交替邏輯)
+            if iterations == 1:
+                side = self.start_side
+            else:
+                side = 'buy' if self.current_side == 'sell' else 'sell'
             self.current_side = side
+
             self.logger.info("-----------------------------------------------")
             self.logger.info(f"🔄 Trading loop iteration {iterations}. Net P&L: {self.current_net_pnl:.2f} USD")
             self.logger.info("-----------------------------------------------")
@@ -433,14 +482,15 @@ class HedgeBot:
                 self.logger.critical(f"❌ 倉位差異過大: {self.grvt_position + self.aster_position}. 停止交易。")
                 break
 
+            # --- 倉位清零校準檢查 ---
             if self.grvt_position != 0 or self.aster_position != 0:
-                self.logger.warning("倉位未清零，跳過開倉。")
+                self.logger.warning("倉位未清零，進行外部校準並跳過開倉。")
+                await self.fetch_current_exchange_positions()
                 await asyncio.sleep(5)
                 continue
 
-
             # --- 階段 1: 開倉與對沖 (Maker: GRVT) ---
-            side = 'buy' if iterations % 2 != 0 else 'sell'
+            self.is_closing = False  # 確保進入開倉階段時旗標為 False
             self.order_execution_complete = False
             self.waiting_for_aster_fill = False
             self.grvt_order_status = None
@@ -471,7 +521,7 @@ class HedgeBot:
                 break
 
             # --- 階段 2: 5 分鐘持倉等待 (含 PNL 風險控制) ---
-            if self.grvt_position != 0 and self.aster_position != 0 and not self.stop_flag:
+            if self.grvt_position != 0 or self.aster_position != 0:  # 確保至少有一邊有倉位
                 self.open_time = time.time()
                 self.pnl_monitor_task = asyncio.create_task(self.calculate_and_monitor_pnl())
 
@@ -494,8 +544,11 @@ class HedgeBot:
 
             # --- 倉位清零最終確認 ---
             start_time = time.time()
+            self.is_closing = True  # 設置平倉狀態，讓 WS 忽略成交觸發
             while (self.grvt_position != 0 or self.aster_position != 0) and not self.stop_flag and (
                     time.time() - start_time < 30):
+                await self.fetch_current_exchange_positions()  # 外部校準
+
                 self.logger.info(f"🔄 等待平倉確認... GRVT: {self.grvt_position}, Aster: {self.aster_position}")
                 await asyncio.sleep(2)
 
@@ -503,7 +556,7 @@ class HedgeBot:
                 self.logger.critical("🚨 嚴重錯誤：平倉後倉位未清零。手動介入！")
                 self.stop_flag = True
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)  # 修正點：平倉後等待 10 秒才進入下一個循環
 
     async def run(self):
         """強制定義 run() 方法，避免 AttributeError."""
