@@ -7,17 +7,14 @@ import traceback
 import dotenv
 from pathlib import Path
 
-# ---- Project path setup ----
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Import bot
 from hedge.hedge_mode_grvtlighter import HedgeBot
 
 
 def parse_arguments():
-    """解析命令行參數：ticker / size / iter / fill-timeout / start-side / env"""
     parser = argparse.ArgumentParser(description="GRVT/Lighter Hedge Mode Launcher")
     parser.add_argument("--ticker", type=str, default="BTC", help="交易對符號 (預設: BTC)")
     parser.add_argument("--size", type=Decimal, default=Decimal("0.001"), help="每筆訂單數量 (預設: 0.001)")
@@ -30,6 +27,31 @@ def parse_arguments():
         default="buy",
         help="第一個循環的開倉方向 (預設: buy)"
     )
+    parser.add_argument("--holding-time", type=int, default=180, help="持倉時間 (秒) (預設: 180)")
+    parser.add_argument("--hedge-timeout", type=int, default=10, help="對沖成交超時 (秒) (預設: 10)")
+    parser.add_argument(
+        "--max-risk-usd",
+        type=Decimal,
+        default=Decimal("30"),
+        help="最大可容忍淨浮動虧損 (USD) (預設: 30)"
+    )
+    parser.add_argument(
+        "--sleep-between-cycles",
+        type=float,
+        default=10.0,
+        help="每個循環間的休息秒數 (預設: 10)"
+    )
+    parser.add_argument(
+        "--open-wait-timeout",
+        type=int,
+        default=None,
+        help="等待 GRVT 開倉成交的超時 (秒)。未指定時使用 fill-timeout。"
+    )
+    parser.add_argument(
+        "--grvt-force-market",
+        action="store_true",
+        help="強制 GRVT 開倉使用 taker/market-like 以保證成交 (debug 用)"
+    )
     parser.add_argument(
         "--env",
         type=str,
@@ -40,20 +62,14 @@ def parse_arguments():
 
 
 def load_env(env_path: str) -> None:
-    """Load .env from given path (best-effort)."""
     p = Path(env_path).expanduser().resolve()
     if p.exists():
         dotenv.load_dotenv(str(p))
     else:
-        # 仍允許使用系統環境變數
         print(f"[WARN] .env not found at: {p} (will rely on existing environment variables)")
 
 
 def validate_env() -> None:
-    """
-    在啟動前檢查關鍵 env，避免跑一半才爆。
-    GRVT/Lighter 需要哪些變數，依你專案而定；這裡先檢查 Lighter 端必要 3 個。
-    """
     required = ["API_KEY_PRIVATE_KEY", "LIGHTER_ACCOUNT_INDEX", "LIGHTER_API_KEY_INDEX"]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
@@ -63,26 +79,47 @@ def validate_env() -> None:
         )
 
 
+def print_config(args) -> None:
+    config = {
+        "ticker": args.ticker.upper(),
+        "size": str(args.size),
+        "iter": args.iter,
+        "fill_timeout": args.fill_timeout,
+        "start_side": args.start_side,
+        "holding_time": args.holding_time,
+        "hedge_timeout": args.hedge_timeout,
+        "max_risk_usd": str(args.max_risk_usd),
+        "sleep_between_cycles": args.sleep_between_cycles,
+        "open_wait_timeout": args.open_wait_timeout if args.open_wait_timeout is not None else args.fill_timeout,
+        "grvt_force_market": args.grvt_force_market,
+        "env": args.env,
+    }
+
+    print("Starting GRVT/Lighter Hedge Mode with config:")
+    for key, value in config.items():
+        print(f"  - {key}: {value}")
+    print("-" * 60)
+
+
 async def start_bot():
     args = parse_arguments()
     load_env(args.env)
 
-    print(
-        f"Starting GRVT/Lighter Hedge Mode: {args.ticker.upper()} | "
-        f"Size: {args.size} | Iter: {args.iter} | FillTimeout: {args.fill_timeout}s | "
-        f"StartSide: {args.start_side}"
-    )
-    print("-" * 60)
-
-    # 檢查必要 env
     validate_env()
+    print_config(args)
 
     bot = HedgeBot(
         ticker=args.ticker.upper(),
         order_quantity=args.size,
         fill_timeout=args.fill_timeout,
         iterations=args.iter,
-        start_side=args.start_side
+        start_side=args.start_side,
+        holding_time=args.holding_time,
+        hedge_timeout=args.hedge_timeout,
+        max_risk_usd=args.max_risk_usd,
+        sleep_between_cycles=args.sleep_between_cycles,
+        open_wait_timeout=args.open_wait_timeout,
+        grvt_force_market=args.grvt_force_market,
     )
 
     await bot.run()
