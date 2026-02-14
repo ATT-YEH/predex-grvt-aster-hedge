@@ -69,29 +69,28 @@ class ParadexClient(BaseExchangeClient):
             os.getenv('PARADEX_L1_ADDRESS')
             or os.getenv('PARADEX_ACCOUNT_ADDRESS')
             or os.getenv('PARADEX_WALLET_ADDRESS')
+            or os.getenv('PARADEX_ETH_ADDRESS')
         )
         self.l2_private_key_hex = (
             os.getenv('PARADEX_L2_PRIVATE_KEY')
             or os.getenv('PARADEX_PRIVATE_KEY')
             or os.getenv('PARADEX_API_PRIVATE_KEY')
+            or os.getenv('PARADEX_STARK_PRIVATE_KEY')
         )
         self.l2_address = (
             os.getenv('PARADEX_L2_ADDRESS')
             or os.getenv('PARADEX_ACCOUNT_ADDRESS')
             or os.getenv('PARADEX_PUBLIC_ADDRESS')
+            or os.getenv('PARADEX_PUBLIC_KEY')
+            or os.getenv('PARADEX_STARK_PUBLIC_KEY')
         )
         self.environment = os.getenv('PARADEX_ENVIRONMENT', 'prod')
 
         # Validate that required credentials are provided
-        if not self.l1_address:
-            raise ValueError(
-                "PARADEX_L1_ADDRESS (or PARADEX_ACCOUNT_ADDRESS / PARADEX_WALLET_ADDRESS) must be set.\n"
-                "This is your Ethereum L1 address."
-            )
-
         if not self.l2_private_key_hex:
             raise ValueError(
-                "PARADEX_L2_PRIVATE_KEY (or PARADEX_PRIVATE_KEY / PARADEX_API_PRIVATE_KEY) must be set.\n"
+                "PARADEX_L2_PRIVATE_KEY (or PARADEX_PRIVATE_KEY / PARADEX_API_PRIVATE_KEY / "
+                "PARADEX_STARK_PRIVATE_KEY) must be set.\n"
                 "Run 'python get_paradex_api_key.py' to generate L2 credentials from L1 credentials."
             )
 
@@ -120,7 +119,7 @@ class ParadexClient(BaseExchangeClient):
         self.order_size_increment = ''
 
     def _initialize_paradex_client(self) -> None:
-        """Initialize the Paradex client with L2 credentials only."""
+        """Initialize the Paradex client with backward-compatible credential strategies."""
         try:
             # Import paradex_py modules locally
             from paradex_py import Paradex
@@ -131,11 +130,36 @@ class ParadexClient(BaseExchangeClient):
                 logger=None  # Disabled native logging
             )
 
-            # Initialize account with L2 private key
-            self.paradex.init_account(
-                l1_address=self.l1_address,
-                l2_private_key=self.l2_private_key
-            )
+            # Try multiple init_account argument sets for SDK compatibility.
+            init_attempts = []
+            if self.l1_address:
+                init_attempts.extend([
+                    {"l1_address": self.l1_address, "l2_private_key": self.l2_private_key},
+                    {"l1_address": self.l1_address, "l2_private_key": self.l2_private_key_hex},
+                ])
+
+            init_attempts.extend([
+                {"l2_private_key": self.l2_private_key},
+                {"l2_private_key": self.l2_private_key_hex},
+            ])
+
+            last_error = None
+            for kwargs in init_attempts:
+                try:
+                    self.paradex.init_account(**kwargs)
+                    last_error = None
+                    break
+                except TypeError as e:
+                    # Different SDK versions accept different signatures.
+                    last_error = e
+                    continue
+                except Exception as e:
+                    # Keep trying other credential styles before failing.
+                    last_error = e
+                    continue
+
+            if last_error:
+                raise last_error
 
             # Log the L2 address being used
             if self.l2_address:
