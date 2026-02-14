@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import argparse
+import importlib.util
 from decimal import Decimal
 import os
 import dotenv
@@ -27,6 +28,13 @@ async def start_bot():
     """初始化並運行 HedgeBot。"""
     args = parse_arguments()
     dotenv.load_dotenv('.env')
+
+    if importlib.util.find_spec("paradex_py") is None:
+        print("❌ Missing dependency: paradex_py")
+        print(f"Current Python executable: {sys.executable}")
+        print("Please install Paradex dependencies in THIS environment:")
+        print(f"  {sys.executable} -m pip install -r para_requirements.txt")
+        return
 
     print(f"Starting GRVT/Paradex Hedge Mode: {args.ticker} Size: {args.size}, Start Side: {args.start_side}")
     print("-" * 50)
