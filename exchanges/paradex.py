@@ -64,22 +64,34 @@ class ParadexClient(BaseExchangeClient):
         # Set config first
         self.config = config
 
-        # Paradex credentials from environment - L1 address + L2 private key
-        self.l1_address = os.getenv('PARADEX_L1_ADDRESS')
-        self.l2_private_key_hex = os.getenv('PARADEX_L2_PRIVATE_KEY')
-        self.l2_address = os.getenv('PARADEX_L2_ADDRESS')
+        # Paradex credentials from environment - support both legacy/new naming styles
+        self.l1_address = (
+            os.getenv('PARADEX_L1_ADDRESS')
+            or os.getenv('PARADEX_ACCOUNT_ADDRESS')
+            or os.getenv('PARADEX_WALLET_ADDRESS')
+        )
+        self.l2_private_key_hex = (
+            os.getenv('PARADEX_L2_PRIVATE_KEY')
+            or os.getenv('PARADEX_PRIVATE_KEY')
+            or os.getenv('PARADEX_API_PRIVATE_KEY')
+        )
+        self.l2_address = (
+            os.getenv('PARADEX_L2_ADDRESS')
+            or os.getenv('PARADEX_ACCOUNT_ADDRESS')
+            or os.getenv('PARADEX_PUBLIC_ADDRESS')
+        )
         self.environment = os.getenv('PARADEX_ENVIRONMENT', 'prod')
 
         # Validate that required credentials are provided
         if not self.l1_address:
             raise ValueError(
-                "PARADEX_L1_ADDRESS must be set in environment variables.\n"
+                "PARADEX_L1_ADDRESS (or PARADEX_ACCOUNT_ADDRESS / PARADEX_WALLET_ADDRESS) must be set.\n"
                 "This is your Ethereum L1 address."
             )
 
         if not self.l2_private_key_hex:
             raise ValueError(
-                "PARADEX_L2_PRIVATE_KEY must be set in environment variables.\n"
+                "PARADEX_L2_PRIVATE_KEY (or PARADEX_PRIVATE_KEY / PARADEX_API_PRIVATE_KEY) must be set.\n"
                 "Run 'python get_paradex_api_key.py' to generate L2 credentials from L1 credentials."
             )
 
@@ -128,6 +140,10 @@ class ParadexClient(BaseExchangeClient):
             # Log the L2 address being used
             if self.l2_address:
                 self.logger.log(f"Using L2 address: {self.l2_address}", "INFO")
+            self.logger.log(
+                "Paradex credential mode initialized (supports legacy/new env key names)",
+                "INFO"
+            )
 
         except Exception as e:
             raise ValueError(f"Failed to initialize Paradex client: {e}")
@@ -421,6 +437,40 @@ class ParadexClient(BaseExchangeClient):
         else:
             raise Exception(f"[OPEN] [{order_id}] Unexpected order status: {order_status}")
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+        """Place a market order for immediate taker hedge execution."""
+        from paradex_py.common.order import Order, OrderType, OrderSide
+
+        if direction == 'buy':
+            order_side = OrderSide.Buy
+        elif direction == 'sell':
+            order_side = OrderSide.Sell
+        else:
+            return OrderResult(success=False, error_message=f"Invalid direction: {direction}")
+
+        try:
+            order = Order(
+                market=contract_id,
+                order_type=OrderType.Market,
+                order_side=order_side,
+                size=quantity.quantize(self.order_size_increment, rounding=ROUND_HALF_UP),
+            )
+            order_result = self._submit_order_with_retry(order)
+            order_id = order_result.get('id')
+            if not order_id:
+                return OrderResult(success=False, error_message='No order ID in market order response')
+
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                side=direction,
+                size=quantity,
+                price=Decimal(order_result.get('avg_fill_price', order_result.get('price', 0))),
+                status=order_result.get('status', 'NEW')
+            )
+        except Exception as e:
+            return OrderResult(success=False, error_message=str(e))
+
     async def _get_active_close_orders(self, contract_id: str) -> int:
         """Get active close orders for a contract using official SDK."""
         active_orders = await self.get_active_orders(contract_id)
@@ -510,12 +560,21 @@ class ParadexClient(BaseExchangeClient):
             order_data = self.paradex.api_client.fetch_order(order_id)
             size = Decimal(order_data.get('size', 0)).quantize(self.order_size_increment, rounding=ROUND_HALF_UP)
             remaining_size = Decimal(order_data.get('remaining_size', 0))
+            status = order_data.get('status', '')
+            mapped_status = status
+            if status == 'NEW':
+                mapped_status = 'OPEN'
+            elif status == 'OPEN' and (size - remaining_size) > 0:
+                mapped_status = 'PARTIALLY_FILLED'
+            elif status == 'CLOSED':
+                mapped_status = 'CANCELED' if order_data.get('cancel_reason') else 'FILLED'
+
             return OrderInfo(
                 order_id=order_data.get('id', ''),
                 side=order_data.get('side', '').lower(),
                 size=size,
                 price=Decimal(order_data.get('price', 0)),
-                status=order_data.get('status', ''),
+                status=mapped_status,
                 filled_size=size - remaining_size,
                 remaining_size=remaining_size,
                 cancel_reason=order_data.get('cancel_reason', '')
